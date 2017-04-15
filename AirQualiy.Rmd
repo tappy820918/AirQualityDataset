@@ -1,0 +1,351 @@
+---
+title: "Air Quality Dataset analysis"
+author: "Hsieh Li-Cheng"
+date: "2017.03.15"
+output:
+  html_document:
+    fig_height: 7
+    highlight: tango
+    keep_md: yes
+    theme: journal
+    toc: yes
+---
+For the Air quality, we first observe the data plot for all of the 13 attributes of the data, with the prior 
+knowledge that for the problem we are interested in, this dataset is 
+- Unsupervised 
+- Missing value NA are encoded with **-200** 
+- Goaled to be used as prediction for the next 7 days of Air Quality condition and attribute prediction 
+- The features may, or should be greatly affected by the time spot in which it is observed 
+-Air quality index (AQI is composed of function of reference analyzer but with more information. 
+First, from the data file, below is the description of each attribute, we made a simple summary of the data. 
+
+
+## Required packages and downloads
+```{r Setting, echo=TRUE, message=FALSE, warning=FALSE}
+package = c("Amelia", "doParallel", "imputeTS","corrplot","kernlab","ggplot2","dygraphs",
+           "ggthemes","forecast","gridExtra","TSA","tseries","xts","GGally", "knitr","plotly")
+Already.Installed.Package = package %in% rownames(installed.packages())
+if(any(!Already.Installed.Package)) install.packages(package[!Already.Installed.Package])
+sapply(package, require, character.only = TRUE)
+```
+
+## prerequisite setting
+```{r}
+CoreNumber = 4
+Cluster = makePSOCKcluster(CoreNumber)
+registerDoParallel(Cluster)
+getDoParWorkers();
+getDoParRegistered();
+gc()
+```
+
+#Download/Import data
+```{r}
+temp = tempfile()
+download.file("https://archive.ics.uci.edu/ml/machine-learning-databases/00360/AirQualityUCI.zip",temp)
+AirQualityUCI = read.table(unz(temp, "AirQualityUCI.csv"),sep =";",dec = ",",header = TRUE)
+unlink(temp)
+#######
+# PATH = "C:\\AirQualityUCI.csv"
+#AirQualityUCI = read.csv(PATH,sep = ";", dec=",", header = TRUE) 
+Data = AirQualityUCI[1:9357,1:15]
+str(Data)
+Namelist = names(Data)
+attach(Data,warn.conflicts = FALSE)
+Timedate = as.POSIXct( strptime( paste(Data$Date,substr(Data$Time,1,2)),"%d/%m/%Y %H"))
+Data[Data == -200] = NA
+invisible(sapply(3:15,function(col){Data[,col] = as.numeric(Data[,col]);} ))
+
+```
+## Plot the time series of data
+```{r Plot time series, echo=TRUE, fig.height=30, message=FALSE, warning=FALSE}
+TS = foreach(col=1:13, .packages=c('ggplot2','ggthemes')) %dopar% {
+  ggplot(Data, aes(Timedate, Data[,col+2])) +
+    geom_point(na.rm=TRUE, color="slategrey", size=0.4) +
+    ggtitle(paste0( Namelist[col+2],"  time series plot")) +
+    xlab("Date") + ylab("Value") +theme_stata()
+}
+grid.arrange(TS[[1]],TS[[2]],TS[[3]],TS[[4]],TS[[5]],TS[[6]],TS[[7]],TS[[8]],
+             TS[[9]],TS[[10]],TS[[11]],TS[[12]],TS[[13]], ncol = 1, nrow = 13)
+```
+
+## Plot the missing value of data
+```{r Plotting missing value, echo=TRUE}
+missmap(Data[,3:15],col = c("red","forestgreen"),main = "Missingness Map for Air Quality dataset")
+```
+
+# Delete variable NMHC.GT., for it only has 0.097% data points
+From the plot(when zooming in the plot afterward), we can identify that the dataset has a seasonal 
+trend of 24 data points per cycle, briefly, has a 1-day cycle trend. By the scatterplot and the Missingness 
+Map, we can see that nearly all of the data from the feature ??NMHC.GT.?? (NMHC(GT)) is missing, hence we 
+exclude this attribute from the dataset in the further analysis. 
+
+```{r}
+HasData = NULL
+for(col in 3:15) HasData[col-2] = length(c(na.exclude(Data[,col])))/dim(Data)[1];
+HasData = data.matrix(HasData)
+row.names(HasData) = c(Namelist[3:15])
+colnames(HasData) = "Non NAs' Percentages"
+kable(HasData)
+AirQualityData = Data[,-5]
+```
+
+# Imput missing data by interpolation methods
+```{r Input NA, echo=TRUE}
+results = foreach(i=3:14,.packages='imputeTS') %dopar% {
+  data.frame(as.matrix(na.seadec(ts(AirQualityData[,i],frequency = 24), algorithm = "interpolation")))}
+AirData =  cbind.data.frame(AirQualityData[,1],AirQualityData[,2])
+for(i in 1:12) AirData = cbind.data.frame(AirData,data.frame(results[[i]]))
+colnames(AirData) = colnames(AirQualityData)
+```
+#Correlation plot before transformation
+```{r Transformed Correlation plot}
+corrplot(cor(AirData[,3:14]),hclust.method = "complete", 
+         order="hclust", bg="lightblue", method = "square")
+```
+
+##Transform and rescale the data
+$$
+PT08.S3.NOx_{new} = \frac{1}{\frac{PT08.S3.NOx_{old}-min(PT08.S3.NOx_{old}+0.1)}{s.d.(min(PT08.S3.NOx_{old})+0.1)}} = \frac{s.d.(min(PT08.S3.NOx_{old}+0.1))}{PT08.S3.NOx_{old}-min(PT08.S3.NOx_{old})+0.1} 
+$$
+$$RH_{new} = 100-RH_{old} $$
+The value 0.1 addition is just for the non-zero correction in scaling, which will alse be used when scaling in Kernel PCA in the next section. 
+
+```{r Transform and rescale}
+AirDataOriginal = AirData #Make a copy
+AirData$PT08.S3.NOx. = sd(AirData$PT08.S3.NOx.)/(AirData$PT08.S3.NOx.-mean(AirData$PT08.S3.NOx.))
+AirData$RH = 100 - AirData$RH
+AirData_mean = NULL;AirData_sd = NULL
+for(col in 1:12){
+  AirData_mean[col] =mean(AirData[,col+2]);
+  AirData_sd[col] =var(AirData[,col+2]);
+  AirData[,col+2] = (AirData[,col+2]-AirData_mean[col])/AirData_sd[col]
+}
+```
+#Correlation plot after transformation
+```{r Correlation plot}
+corrplot(cor(AirData[,3:14]),hclust.method = "complete", 
+         order="hclust", bg="lightblue", method = "square")
+```
+
+##BoxCox transform
+```{r BoxCox}
+foreach(i=1:12,.packages="forecast") %dopar% {  
+  BoxCox.lambda(1:length(AirDataOriginal[,i]));}
+```
+
+# **Time Series Diagnosis Plot**
+
+##ACF plot
+```{r ACF, fig.width=15}
+ACF = foreach(col=1:12, .packages=c('ggplot2','ggthemes')) %dopar% {
+  autoplot(acf(AirDataOriginal[,col+2],lag.max = 30, plot = FALSE)) + 
+    ggtitle(colnames(AirDataOriginal)[col+2]) + theme_economist()
+}
+grid.arrange(ACF[[1]],ACF[[2]],ACF[[3]],ACF[[4]],ACF[[5]],ACF[[6]],ACF[[7]],ACF[[8]],
+             ACF[[9]],ACF[[10]],ACF[[11]],ACF[[12]], ncol = 4, nrow = 3)
+
+```
+
+## **PACF plot**
+```{r PACF, fig.width=15}
+PACF = foreach(col=1:12, .packages=c('ggfortify','ggthemes')) %dopar% {
+  autoplot(pacf(AirDataOriginal[,col+2],lag.max = 30, plot = FALSE)) + 
+    ggtitle(colnames(AirDataOriginal)[col+2]) + theme_economist()
+}
+grid.arrange(PACF[[1]],PACF[[2]],PACF[[3]],PACF[[4]],PACF[[5]],PACF[[6]],PACF[[7]],PACF[[8]],
+             PACF[[9]],PACF[[10]],PACF[[11]],PACF[[12]], ncol = 4, nrow = 3)
+```
+
+## **ACF plot with lag = 24**
+```{r SACF, fig.width=15}
+SACF = foreach(col=1:12, .packages=c('ggfortify','ggthemes')) %dopar% {
+  autoplot (acf(diff(AirDataOriginal[,col+2],lag = 24),lag.max = 30, plot = FALSE)) + 
+    ggtitle(colnames(AirDataOriginal)[col+2]) + theme_economist()
+}
+
+grid.arrange(SACF[[1]],SACF[[2]],SACF[[3]],SACF[[4]],SACF[[5]],SACF[[6]],SACF[[7]],SACF[[8]],
+             SACF[[9]],SACF[[10]],SACF[[11]],SACF[[12]], ncol = 4, nrow = 3)
+```
+
+## **PACF plot with lag = 24**
+```{r SPACF, fig.width=15}
+SPACF = foreach(col=1:12, .packages=c('ggfortify','ggthemes')) %dopar% {
+  autoplot(pacf(diff(AirDataOriginal[,col+2],lag = 24),lag.max = 30, plot = FALSE)) + 
+    ggtitle(colnames(AirDataOriginal)[col+2]) + theme_economist()
+}
+grid.arrange(SPACF[[1]],SPACF[[2]],SPACF[[3]],SPACF[[4]],SPACF[[5]],SPACF[[6]],SPACF[[7]],SPACF[[8]],
+             SPACF[[9]],SPACF[[10]],SPACF[[11]],SPACF[[12]], ncol = 4, nrow = 3)
+```
+
+#`Kernel PCA`
+```{r Kernel PCA, fig.height=10, fig.width=12}
+RASum = AirData$CO.GT.+ AirData$C6H6.GT. + AirData$NOx.GT. + AirData$NO2.GT.
+kpc = kpca(cbind(AirData[,3:14],RASum),features = 1)
+PCV_score = as.matrix(cbind(AirData[,3:14],RASum)) %*% pcv(kpc)
+ggplot(cbind.data.frame(Timedate,PCV_score), aes(Timedate, PCV_score)) + geom_line(color="slategrey") + geom_point(color="slategrey",size = 0.7) + 
+ggtitle("Kernel PCA score Series plot") + xlab("Date") + ylab("Kernel PCA scores")
+```
+
+```{r, fig.height=10, fig.width=12}
+TD = cbind.data.frame(Timedate,PCV_score)
+time_kpca = seq(from = as.POSIXct(Timedate[1]), 
+                  to = as.POSIXct( Timedate[length(Timedate)]), by = "hour")
+Scoredata = xts(PCV_score, order.by = time_kpca)
+colnames(Scoredata) = "Score"
+dygraph(Scoredata, main = "Kernel PCA score Series plot", ylab = "Kernel PCA score") %>% 
+dyOptions(drawPoints = TRUE, colors = RColorBrewer::brewer.pal(7, "Set2")) %>% 
+dyRangeSelector()
+
+```
+
+# Train model **Will take some time**
+```{r Train model, message=FALSE, warning=FALSE}
+gc()
+ModelList= NULL
+for(col in 3:14){
+  ModelList[[col-2]]=auto.arima(ts(AirDataOriginal[,col],frequency = 24),trace = TRUE,seasonal = TRUE,
+             allowdrift = TRUE, num.cores = CoreNumber, parallel = TRUE,test = "kpss",stepwise = FALSE,
+             max.q = 2,max.p = 1,max.Q = 1,max.d = 2,max.order = 2,start.p = 1)
+}
+```
+
+##Print model
+```{r Print model}
+sapply(1:12, function(i){paste("Model for attribute",i," : ",ModelList[[i]])})
+```
+##Box-Ljung test
+```{r Box-Ljung test}
+BL_Pvalue = sapply(1:12, function(i){
+  Box.test(ModelList[[i]]$residuals,type = "Ljung")$p.value})
+BL_Pvalue
+```
+##Jarque Bera normallity test
+```{r Jarque Bera normallity test}
+JB_Pvalue = sapply(1:12, function(i){
+  jarque.bera.test(ModelList[[i]]$residuals)$p.value})
+table(JB_Pvalue)
+```
+
+##################
+# Forecast data
+```{r Forecast data}
+Forecast = foreach(i=1:12,.packages='forecast') %dopar% {
+  data.frame(forecast(ModelList[[i]], 7*24))
+}
+```
+
+##plot forecast data
+```{r Plot forecast data, fig.height=15, fig.width=15}
+P = foreach(i=1:12,.packages=c('ggplot2','ggthemes')) %dopar% {
+  autoplot(forecast(ModelList[[i]],7*24),ylab = "Value",main = colnames(AirData)[i])+
+  theme_classic()
+  }
+grid.arrange(P[[1]],P[[2]],P[[3]],P[[4]],
+             P[[5]],P[[6]],P[[7]],P[[8]],
+             P[[9]],P[[10]],P[[11]],P[[12]],
+             ncol = 3, nrow = 4)
+```
+
+#Process Forecastion data
+```{r}
+ForecastTime = seq(Timedate[length(Timedate)], by="hours", length=7*24+1)[-1]
+Total_Timedate = c(Timedate,ForecastTime)
+ForecastData = matrix(0,7*24,12)
+ForecastData = sapply(1:12, function(i){ForecastData[,i] = as.matrix(Forecast[[i]]$Point.Forecast);})
+ForecastData = as.data.frame(ForecastData)
+colnames(ForecastData) = c(Namelist[3:4],Namelist[6:15])
+```
+#Reweight the forecast data
+```{r Reweight forecast data}
+ForecastData$PT08.S3.NOx. = sd(ForecastData$PT08.S3.NOx.)/(ForecastData$PT08.S3.NOx.-mean(ForecastData$PT08.S3.NOx.))
+ForecastData$RH = 100 - ForecastData$RH
+ForecastDataNew = matrix(0,length(ForecastData[,1]),12)
+for(col in 1:12) ForecastDataNew[,col] = (ForecastData[,col]-AirData_mean[col])/AirData_sd[col]
+ForecastDataNew = data.frame(ForecastDataNew)
+colnames(ForecastDataNew) = c(Namelist[3:4],Namelist[6:15])
+RASumNew = ForecastDataNew$CO.GT.+ ForecastDataNew$C6H6.GT. + ForecastDataNew$NOx.GT. + ForecastDataNew$NO2.GT.
+Forecast_PCV_score = cbind(as.matrix(ForecastDataNew),RASumNew) %*% pcv(kpc)
+```
+# Train the KPCA series Model
+```{r Train KPCA Model}
+PCV_Model = auto.arima(ts(PCV_score,frequency = 24),trace = TRUE,seasonal = TRUE,
+           allowdrift = TRUE, num.cores = CoreNumber, parallel = TRUE,test = "kpss",stepwise = FALSE,
+           max.q = 2,max.p = 2,max.Q = 1,max.d = 2,max.order = 3,start.p = 1)
+paste(PCV_Model)
+PCV_Model_Forecast = forecast(PCV_Model,7*24)
+```
+
+## Combine the final series by choosing the maximum of 2 series
+```{r Combined Score Series}
+combinedSeries = NULL
+combinedSeries = sapply(1:length(Forecast_PCV_score), 
+           function(i) {combinedSeries[i] = max(c(Forecast_PCV_score)[i],c(PCV_Model_Forecast$mean)[i])} )
+PCVSeries = cbind.data.frame(Score = c(PCV_score,combinedSeries) , Total_Timedate)
+Series = c(rep("steelblue",length(PCV_score)),rep("firebrick",length(combinedSeries)))
+```
+#**Plot the Kernel PCA scores**
+```{r Output plot, echo=TRUE, fig.height=15}
+Full = ggplot(aes(Total_Timedate,Score), data = PCVSeries) +  
+  geom_point(colour = Series,size = 0.7) + geom_line(colour = Series) + xlab("Time") +  ylab("Value") + 
+  ggtitle("Kernel PCA Full series ") + theme_stata() +
+  theme(panel.grid.minor = element_line(linetype = "dotted"),legend.position = "top")
+
+New_Forecast_plot = ggplot(aes(x =ForecastTime, y = c(Forecast_PCV_score), colour = "steelblue"), 
+                    data = data.frame(Forecast_PCV_score)) + geom_point(color = "steelblue") + 
+                    geom_line(color = "steelblue") + xlab("Time") +  ylab("Value")+ theme_stata()  + 
+                    ggtitle("Kernel PCA prediction series by extraction of new predicted series ") + 
+                    theme(panel.grid.minor = element_line(linetype = "dotted"), legend.position = "none")
+
+PCV_Model_Forecast_plot = ggplot(aes(x = ForecastTime, y = c(PCV_Model_Forecast$mean)),
+                          data = data.frame(PCV_Model_Forecast$mean)) + geom_point(color = "steelblue") + 
+                          geom_line(color = "steelblue") + xlab("Time") +  ylab("Value") + theme_stata() +
+                          ggtitle("Kernel PCA prediction series by prediction of former Kernel PCA score series ") + 
+                          theme(panel.grid.minor = element_line(linetype = "dotted"),legend.position = "none") 
+combined_Forecast_plot =  ggplot(aes(x = ForecastTime, y = c(combinedSeries), colour = 2),
+                                 data = data.frame(combinedSeries)) + theme_stata() +
+  geom_point() + geom_line() + xlab("Time") +  ylab("Value") +
+  ggtitle("Aggregrated Kernel PCA prediction series ") + 
+  theme(panel.grid.minor = element_line(linetype = "dotted"),legend.position = "none") 
+
+grid.arrange(Full, New_Forecast_plot, PCV_Model_Forecast_plot,combined_Forecast_plot, nrow = 4)
+```
+
+```{r Interactive Plot of Final Result, fig.width=12}
+combined_Forecast_ts = xts(combinedSeries,order.by = ForecastTime )
+PCV_Model_Forecast_ts = xts( c(PCV_Model_Forecast$mean),order.by = ForecastTime )
+New_Forecast_ts = xts( c(Forecast_PCV_score),order.by = ForecastTime )
+colnames(New_Forecast_ts) = "KPCA on variables"
+colnames(PCV_Model_Forecast_ts) = "KPCA Forecasting"
+colnames(combined_Forecast_ts) = "Combined Score"
+
+
+dygraph(cbind(combined_Forecast_ts,New_Forecast_ts,PCV_Model_Forecast_ts,Scoredata), main = "Kernel PCA score Series plot", ylab = "Kernel PCA score") %>% 
+dyOptions(drawPoints = TRUE, colors = RColorBrewer::brewer.pal(3, "Set2"))%>%
+dyHighlight(highlightSeriesOpts = list(strokeWidth = 2)) %>%
+dyShading(from = ForecastTime[1], to = ForecastTime[length(ForecastTime)], color = "#CCEBD6")%>% 
+dyRangeSelector(dateWindow = c(Timedate[floor(length(Timedate)*0.95)], ForecastTime[length(ForecastTime)]))
+
+
+
+```
+
+##Correlation of 3 Score series
+```{r corrraltion of diffrent forecast method}
+ggcorr(cbind.data.frame(CombinedScore = combinedSeries,
+                        ScoreByPredictedFeature = Forecast_PCV_score,
+                        ScoreByForecast = PCV_Model_Forecast$mean)) + 
+       ggtitle("Correlation Plot") +theme_dark()
+```
+
+##Stop Cluster
+```{r}
+gc()
+stopCluster(Cluster)
+```
+#--------------------------- Conclusion -----------------------------
+ 
+From the data plot, we can see that the trend series of the prediction is an upward trend in the future, 
+but compared to the past data, it is considered as an air quality in the future. From the correlation plot, the prediction from 2 ways actually converges to the same prediction, which means that the prediction and the Kernel Score for the data is considered as a plausible solution to be a score in the future, under the assumption that value is correlated to air pollution. 
+
+
